@@ -1,4 +1,4 @@
-# ─── moddy-feeds — image worker (pas de port exposé) ───────────────────────
+# ─── moddy-feeds — image worker ────────────────────────────────────────────
 FROM python:3.11-slim AS base
 
 # Logs Python non bufferisés → visibles immédiatement dans Railway.
@@ -21,5 +21,8 @@ COPY migrations/ ./migrations/
 RUN useradd --create-home --uid 10001 moddy
 USER moddy
 
-# Aucun EXPOSE : worker pur (commandes/queue via Redis).
+# Le service reste un worker (commandes/queue via Redis). Le port n'est ouvert
+# que si WEBSUB_CALLBACK_URL/WEBSUB_SECRET sont fournis — sinon rien n'écoute.
+EXPOSE 8080
+
 CMD ["python", "-m", "app.main"]

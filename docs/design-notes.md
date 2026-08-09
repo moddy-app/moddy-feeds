@@ -83,7 +83,11 @@ thundering-herd.
 - Un redémarrage ne renotifie **jamais** un contenu déjà publié (dédup Redis).
 - Bluesky ne perd **aucun** post pendant la coupure (reprise par cursor).
 - Le premier tick après un boot peut poller un lot de cibles « en retard », mais
-  la charge est bornée (`LIMIT 200`/tick, concurrence 20, requêtes conditionnelles
-  qui répondent `304`).
+  la charge est bornée (`SCHEDULER_BATCH_LIMIT` par lot, `SCHEDULER_MAX_BATCHES`
+  lots par tick, concurrence `POLL_CONCURRENCY`, requêtes conditionnelles qui
+  répondent `304`).
+- Les baux push (`state.push_until`) sont en DB : après un redémarrage, le
+  scheduler sait encore quelles cibles sont couvertes en temps réel et ne
+  repart pas en polling rapide sur tout le catalogue.
 - Les marquages « premier poll » (`initialized`) sont en DB ⇒ pas de rafale de
   notifications initiales après un restart.

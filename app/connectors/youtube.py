@@ -129,47 +129,72 @@ class YouTubeConnector(Connector):
             raise ResolveError("bad_status", f"HTTP {resp.status_code}")
 
         target.state["etag"] = resp.headers.get("ETag")
+        return await parse_feed(resp.content, target, prime=prime)
 
-        try:
-            root = ET.fromstring(resp.content)
-        except ET.ParseError as exc:
-            raise ResolveError("parse_error", str(exc)) from exc
+    # ─── Hook push (WebSub) ──────────────────────────────────────────────────
+    async def on_subscribe(self, target: Target) -> None:
+        """Demande au hub PubSubHubbub de pousser les futures vidéos de la chaîne."""
+        from app import websub
 
-        # La chaîne peut être renommée : rafraîchir le nom depuis le feed.
-        feed_author = root.findtext("atom:author/atom:name", namespaces=NS)
-        if feed_author and feed_author != target.display_name:
-            target.display_name = feed_author
+        await websub.request_subscription(target.target_id)
 
-        events: list[dict[str, Any]] = []
-        for entry in root.findall("atom:entry", NS):
-            video_id = entry.findtext("yt:videoId", namespaces=NS)
-            if not video_id:
-                continue
-            title = entry.findtext("atom:title", namespaces=NS)
-            published = entry.findtext("atom:published", namespaces=NS)
-            eid = f"youtube:{video_id}"
+    async def on_unsubscribe(self, target_id: str) -> None:
+        from app import websub
 
-            if prime or not target.state.get("initialized"):
-                await mark_seen(eid)
-                continue
-            # Filtre re-publications et lives programmés (date future).
-            if too_old(published, hours=24) or is_future(published):
-                continue
+        await websub.request_unsubscription(target_id)
 
-            events.append(
-                make_event(
-                    event_id=eid,
-                    platform="youtube",
-                    type="video",
-                    target_id=target.target_id,
-                    author_name=target.display_name,
-                    author_avatar=target.avatar_url,
-                    title=title,
-                    url=f"https://youtube.com/watch?v={video_id}",
-                    thumbnail=f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
-                    published_at=published,
-                )
+
+async def parse_feed(
+    raw: bytes, target: Target, *, prime: bool = False
+) -> list[dict[str, Any]]:
+    """Transforme un feed Atom YouTube en événements normalisés.
+
+    Partagé par les deux chemins d'arrivée — poll périodique et push WebSub — pour
+    qu'ils produisent des événements strictement identiques (même `event_id`,
+    donc une seule notification quel que soit le chemin le plus rapide).
+
+    Mute l'état de `target` (`display_name`, `initialized`) ; l'appelant persiste.
+    """
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError as exc:
+        raise ResolveError("parse_error", str(exc)) from exc
+
+    # La chaîne peut être renommée : rafraîchir le nom depuis le feed.
+    feed_author = root.findtext("atom:author/atom:name", namespaces=NS)
+    if feed_author and feed_author != target.display_name:
+        target.display_name = feed_author
+
+    events: list[dict[str, Any]] = []
+    for entry in root.findall("atom:entry", NS):
+        video_id = entry.findtext("yt:videoId", namespaces=NS)
+        if not video_id:
+            continue
+        title = entry.findtext("atom:title", namespaces=NS)
+        published = entry.findtext("atom:published", namespaces=NS)
+        eid = f"youtube:{video_id}"
+
+        if prime or not target.state.get("initialized"):
+            await mark_seen(eid)
+            continue
+        # Filtre re-publications et lives programmés (date future).
+        if too_old(published, hours=24) or is_future(published):
+            continue
+
+        events.append(
+            make_event(
+                event_id=eid,
+                platform="youtube",
+                type="video",
+                target_id=target.target_id,
+                author_name=target.display_name,
+                author_avatar=target.avatar_url,
+                title=title,
+                url=f"https://youtube.com/watch?v={video_id}",
+                thumbnail=f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
+                published_at=published,
             )
+        )
 
-        target.state["initialized"] = True
-        return events
+    target.state["initialized"] = True
+    return events

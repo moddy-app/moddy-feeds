@@ -163,9 +163,9 @@ dans la réponse.
 
 | Plateforme | Min | Max | Défaut |
 |---|---|---|---|
-| youtube | 60 s | 3600 s | 300 s |
-| twitch | 30 s | 600 s | 60 s |
-| rss | 120 s | 3600 s | 300 s |
+| youtube | 30 s | 3600 s | 120 s |
+| twitch | 10 s | 600 s | 30 s |
+| rss | 60 s | 3600 s | 180 s |
 | instagram (futur) | 600 s | 86400 s | 1800 s |
 | bluesky | — | — | temps réel (paramètre **ignoré**) |
 

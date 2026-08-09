@@ -20,6 +20,11 @@ CONSUMER_GROUP = "moddy-feeds"
 KEY_HEARTBEAT = "feeds:heartbeat"
 KEY_BLUESKY_CURSOR = "feeds:bluesky:cursor"
 KEY_TWITCH_TOKEN = "feeds:twitch:token"
+# EventSub WebSocket : token *utilisateur* (≠ token applicatif) et son refresh
+# token, qui tourne à chaque échange — il doit donc être persisté ici et non
+# relu depuis l'environnement, sinon le service perd l'accès au redémarrage.
+KEY_TWITCH_USER_TOKEN = "feeds:twitch:user_token"
+KEY_TWITCH_USER_REFRESH = "feeds:twitch:user_refresh"
 
 # TTL de la dédup des événements (7 jours, cf. PROMPT §3).
 DEDUP_TTL_SECONDS = 604_800

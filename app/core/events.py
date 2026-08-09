@@ -93,3 +93,42 @@ async def publish_event(event: dict[str, Any]) -> bool:
     )
     log.info("published %s (%s)", event_id, event.get("type"))
     return True
+
+
+async def publish_events(events: list[dict[str, Any]]) -> int:
+    """Publie un lot d'événements en 2 aller-retours Redis. Retourne le nb publié.
+
+    Le `SET NX` reste la seule porte d'entrée (invariant de dédup) : il est
+    simplement pipeliné pour tout le lot, puis seuls les survivants sont `xadd`
+    en un second pipeline. Sur une chaîne qui publie 5 vidéos d'un coup, ça passe
+    de 10 aller-retours séquentiels à 2.
+    """
+    if not events:
+        return 0
+    if len(events) == 1:
+        return 1 if await publish_event(events[0]) else 0
+
+    client = r.get_redis()
+
+    dedup = client.pipeline(transaction=False)
+    for event in events:
+        dedup.set(r.dedup_key(event["event_id"]), "1", nx=True, ex=r.DEDUP_TTL_SECONDS)
+    created = await dedup.execute()
+
+    fresh = [e for e, ok in zip(events, created) if ok]
+    if not fresh:
+        return 0
+
+    publish = client.pipeline(transaction=False)
+    for event in fresh:
+        publish.xadd(
+            r.STREAM_NOTIFICATIONS,
+            {"data": json.dumps(event, separators=(",", ":"))},
+            maxlen=r.NOTIFICATIONS_MAXLEN,
+            approximate=True,
+        )
+    await publish.execute()
+
+    for event in fresh:
+        log.info("published %s (%s)", event["event_id"], event.get("type"))
+    return len(fresh)

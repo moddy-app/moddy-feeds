@@ -10,6 +10,7 @@ avant de reset `live=False` (micro-coupures Twitch).
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 
@@ -41,8 +42,49 @@ def _chunked(seq: list[str], size: int) -> list[list[str]]:
     return [seq[i : i + size] for i in range(0, len(seq), size)]
 
 
+def make_live_event(
+    stream: dict[str, Any], display_name: str | None, avatar_url: str | None
+) -> dict[str, Any]:
+    """Événement `live` normalisé depuis un objet stream Helix.
+
+    Partagé avec le worker EventSub : les deux transports doivent produire
+    **exactement le même `event_id`** (`twitch:{stream_id}`), c'est ce qui permet
+    à la dédup Redis de les faire cohabiter sans double notification — le plus
+    rapide des deux gagne, l'autre est ignoré.
+    """
+    return make_event(
+        event_id=f"twitch:{stream['id']}",
+        platform="twitch",
+        type="live",
+        target_id=stream["user_id"],
+        author_name=stream.get("user_name") or display_name,
+        author_avatar=avatar_url,
+        title=stream.get("title"),
+        content=stream.get("game_name"),
+        url=f"https://twitch.tv/{stream.get('user_login', '')}",
+        thumbnail=(stream.get("thumbnail_url") or "")
+        .replace("{width}", "1280")
+        .replace("{height}", "720"),
+        published_at=stream.get("started_at"),
+    )
+
+
 class TwitchConnector(Connector):
     platform = "twitch"
+
+    def __init__(self) -> None:
+        # Renseigné par le worker EventSub à son démarrage (s'il est configuré).
+        # Permet aux hooks abonnement/désabonnement de reconfigurer le websocket
+        # à chaud, sans que ce module dépende du worker (import à sens unique).
+        self.eventsub: Any | None = None
+
+    async def on_subscribe(self, target: Target) -> None:
+        if self.eventsub is not None:
+            await self.eventsub.watch(target.target_id)
+
+    async def on_unsubscribe(self, target_id: str) -> None:
+        if self.eventsub is not None:
+            await self.eventsub.unwatch(target_id)
 
     # ─── Token applicatif (cache Redis) ──────────────────────────────────────
     async def _get_token(self) -> str:
@@ -69,6 +111,10 @@ class TwitchConnector(Connector):
         ttl = max(60, int(body.get("expires_in", 3600)) - 300)
         await client.set(r.KEY_TWITCH_TOKEN, token, ex=ttl)
         return token
+
+    async def app_headers(self) -> dict[str, str]:
+        """En-têtes Helix avec le token applicatif (réutilisé par le worker EventSub)."""
+        return await self._headers()
 
     async def _headers(self) -> dict[str, str]:
         return {
@@ -112,23 +158,60 @@ class TwitchConnector(Connector):
             return
 
         headers = await self._headers()
-        http = get_http()
-        live_now: dict[str, dict[str, Any]] = {}
+        live_now = await self._fetch_live(targets, headers)
 
-        for batch in _chunked([t.target_id for t in targets], 100):
+        # L'ordre des trois étapes suivantes est ce qui tient la latence :
+        # calculer les transitions (pur, sans I/O), PUBLIER, puis seulement
+        # persister. Publier en série avec un write DB entre chaque, sur un lot
+        # de 500 cibles, faisait attendre 499 aller-retours à la dernière notif.
+        pending: list[tuple[Target, dict[str, Any]]] = []
+        for t in targets:
+            if event := self._transition(t, live_now.get(t.target_id)):
+                pending.append((t, event))
+
+        published = (
+            await asyncio.gather(*(publish_event(e) for _, e in pending)) if pending else []
+        )
+        with_event = {id(t) for (t, _), ok in zip(pending, published) if ok}
+
+        # Hors du chemin critique : appel /users throttlé, puis une seule
+        # écriture par cible (l'état d'avatar est déjà muté à ce stade).
+        await self._refresh_avatars(targets, headers)
+        await asyncio.gather(
+            *(
+                save_target_state(t, mark_polled=False, had_event=id(t) in with_event)
+                for t in targets
+            ),
+            return_exceptions=True,
+        )
+
+    async def _fetch_live(
+        self, targets: list[Target], headers: dict[str, str]
+    ) -> dict[str, dict[str, Any]]:
+        """Interroge /streams par lots de 100, les lots **en parallèle**.
+
+        En séquentiel, 500 cibles = 5 aller-retours en série avant la première
+        publication ; ce délai s'ajoute tel quel à la latence de notification.
+        """
+        http = get_http()
+        chunks = _chunked([t.target_id for t in targets], 100)
+
+        async def fetch(batch: list[str]) -> list[dict[str, Any]]:
             params = [("user_id", uid) for uid in batch] + [("first", "100")]
             resp = await http.get(_STREAMS_URL, params=params, headers=headers)
             if resp.status_code != 200:
                 log.warning("twitch /streams HTTP %s", resp.status_code)
+                return []
+            return resp.json().get("data", [])
+
+        live_now: dict[str, dict[str, Any]] = {}
+        for result in await asyncio.gather(*(fetch(c) for c in chunks), return_exceptions=True):
+            if isinstance(result, BaseException):
+                log.warning("twitch /streams chunk failed: %s", result)
                 continue
-            for s in resp.json().get("data", []):
+            for s in result:
                 live_now[s["user_id"]] = s
-
-        # Rafraîchissement throttlé des avatars (absents de /streams → appel /users).
-        await self._refresh_avatars(targets, headers)
-
-        for t in targets:
-            await self._reconcile(t, live_now.get(t.target_id))
+        return live_now
 
     async def _refresh_avatars(self, targets: list[Target], headers: dict[str, str]) -> None:
         """Met à jour avatar + display_name au plus une fois/24 h par cible (batch 100)."""
@@ -137,22 +220,36 @@ class TwitchConnector(Connector):
             return
         http = get_http()
         by_id = {t.target_id: t for t in due}
-        for batch in _chunked(list(by_id), 100):
+
+        async def fetch(batch: list[str]) -> list[dict[str, Any]]:
             params = [("id", uid) for uid in batch]
             resp = await http.get(_USERS_URL, params=params, headers=headers)
             if resp.status_code != 200:
+                return []
+            return resp.json().get("data", [])
+
+        chunks = _chunked(list(by_id), 100)
+        for result in await asyncio.gather(*(fetch(c) for c in chunks), return_exceptions=True):
+            if isinstance(result, BaseException):
+                log.warning("twitch /users chunk failed: %s", result)
                 continue
-            for u in resp.json().get("data", []):
+            for u in result:
                 t = by_id.get(u["id"])
                 if not t:
                     continue
                 t.display_name = u.get("display_name") or t.display_name
                 t.avatar_url = u.get("profile_image_url") or t.avatar_url
                 stamp_meta_refresh(t.state)
+                # Pas de write ici : l'appelant persiste tout en une passe.
 
-    async def _reconcile(self, t: Target, stream: dict[str, Any] | None) -> None:
+    @staticmethod
+    def _transition(t: Target, stream: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Applique la transition live/offline à `t.state`. Retourne l'event à publier.
+
+        Fonction **pure d'I/O** (elle ne fait que muter l'état en mémoire), pour
+        que l'appelant puisse publier tout un lot d'un coup puis persister.
+        """
         was_live = bool(t.state.get("live", False))
-        had_event = False
 
         # Le streamer peut renommer son display_name : rafraîchir quand on l'a.
         if stream and (name := stream.get("user_name")) and name != t.display_name:
@@ -162,24 +259,8 @@ class TwitchConnector(Connector):
             # offline → live : nouvelle notif.
             t.state["live"] = True
             t.state["offline_cycles"] = 0
-            had_event = await publish_event(
-                make_event(
-                    event_id=f"twitch:{stream['id']}",
-                    platform="twitch",
-                    type="live",
-                    target_id=t.target_id,
-                    author_name=stream.get("user_name") or t.display_name,
-                    author_avatar=t.avatar_url,
-                    title=stream.get("title"),
-                    content=stream.get("game_name"),
-                    url=f"https://twitch.tv/{stream.get('user_login', '')}",
-                    thumbnail=(stream.get("thumbnail_url") or "")
-                    .replace("{width}", "1280")
-                    .replace("{height}", "720"),
-                    published_at=stream.get("started_at"),
-                )
-            )
-        elif stream and was_live:
+            return make_live_event(stream, t.display_name, t.avatar_url)
+        if stream and was_live:
             # Toujours live : reset le compteur d'absence.
             t.state["offline_cycles"] = 0
         elif not stream and was_live:
@@ -189,8 +270,7 @@ class TwitchConnector(Connector):
             if cycles >= _OFFLINE_CONFIRM_CYCLES:
                 t.state["live"] = False
                 t.state["offline_cycles"] = 0
-
-        await save_target_state(t, mark_polled=True, had_event=had_event)
+        return None
 
     async def poll(self, target: Target) -> list[dict[str, Any]]:  # pragma: no cover
         raise NotImplementedError("Twitch utilise poll_batch (batching /streams)")

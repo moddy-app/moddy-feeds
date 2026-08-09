@@ -1,10 +1,19 @@
-"""Point d'entrée — lance tous les workers asyncio (aucun serveur HTTP).
+"""Point d'entrée — lance tous les workers asyncio.
 
-Tâches lancées en parallèle :
+Tâches toujours lancées :
   • consumer feeds:commands  (abonnements / désabonnements)
   • scheduler tick           (polling YouTube / RSS / Twitch / Instagram)
   • worker Bluesky Jetstream (websocket temps réel)
   • heartbeat                (healthcheck Railway via Redis)
+
+Tâches conditionnelles (temps réel, activées par la config) :
+  • Twitch EventSub          (websocket sortant ; `TWITCH_USER_REFRESH_TOKEN`)
+  • serveur + renouvellement WebSub YouTube (HTTP entrant ; `WEBSUB_CALLBACK_URL`)
+
+Les deux chemins temps réel sont des **accélérateurs**, jamais des dépendances :
+sans leur configuration, le service fonctionne à l'identique en polling, et si
+l'un d'eux tombe en marche, le lease `state.push_until` expire et le polling
+rapide reprend de lui-même.
 
 Arrêt propre sur SIGINT/SIGTERM : annulation des tâches puis fermeture des pools.
 """
@@ -47,6 +56,26 @@ async def main() -> None:
     if settings.bluesky_enabled:
         bluesky: BlueskyConnector = get_connector("bluesky")  # type: ignore[assignment]
         tasks.append(asyncio.create_task(bluesky.run(), name="bluesky"))
+
+    if settings.eventsub_configured:
+        from app.connectors.twitch_eventsub import TwitchEventSub
+
+        eventsub = TwitchEventSub()
+        # Le connecteur relaie les hooks abonnement/désabonnement au websocket.
+        get_connector("twitch").eventsub = eventsub  # type: ignore[attr-defined]
+        tasks.append(asyncio.create_task(eventsub.run(), name="twitch-eventsub"))
+        log.info("twitch eventsub enabled (websocket transport)")
+    elif settings.eventsub_enabled and settings.twitch_configured:
+        log.info("twitch eventsub disabled: TWITCH_USER_REFRESH_TOKEN absent — polling seul")
+
+    if settings.websub_configured:
+        from app import websub
+
+        tasks.append(asyncio.create_task(websub.run_server(), name="websub-server"))
+        tasks.append(asyncio.create_task(websub.run_renewal_worker(), name="websub-renewal"))
+        log.info("youtube websub enabled (callback=%s)", settings.websub_callback_url)
+    else:
+        log.info("youtube websub disabled: WEBSUB_CALLBACK_URL/SECRET absents — polling seul")
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
