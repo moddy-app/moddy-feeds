@@ -7,10 +7,11 @@ Résolution @handle → channel_id : API Data v3 si `YOUTUBE_API_KEY` présent
 from __future__ import annotations
 
 import re
-import xml.etree.ElementTree as ET
 from typing import Any
 
 import httpx
+from defusedxml import ElementTree as ET
+from defusedxml.common import DefusedXmlException
 
 from app.config import settings
 from app.connectors.base import Connector, ResolveError, ResolvedTarget
@@ -61,7 +62,10 @@ class YouTubeConnector(Connector):
             raise ResolveError("fetch_failed", str(exc)) from exc
         if resp.status_code != 200:
             raise ResolveError("channel_not_found", f"HTTP {resp.status_code}")
-        root = ET.fromstring(resp.content)
+        try:
+            root = ET.fromstring(resp.content)
+        except (ET.ParseError, DefusedXmlException) as exc:
+            raise ResolveError("parse_error", str(exc)) from exc
         name = root.findtext("atom:title", default=channel_id, namespaces=NS)
         return ResolvedTarget(target_id=channel_id, display_name=name)
 
@@ -132,7 +136,7 @@ class YouTubeConnector(Connector):
 
         try:
             root = ET.fromstring(resp.content)
-        except ET.ParseError as exc:
+        except (ET.ParseError, DefusedXmlException) as exc:
             raise ResolveError("parse_error", str(exc)) from exc
 
         # La chaîne peut être renommée : rafraîchir le nom depuis le feed.
