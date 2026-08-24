@@ -75,6 +75,11 @@ class Settings(BaseSettings):
     bluesky_enabled: bool = Field(default=True, alias="BLUESKY_ENABLED")
     instagram_enabled: bool = Field(default=False, alias="INSTAGRAM_ENABLED")
 
+    # Moddy Health Monitor (heartbeat sortant, cf. docs/integration.md). Absents
+    # → heartbeat désactivé proprement (pas d'impact sur le reste du service).
+    hm_url: str | None = Field(default=None, alias="HM_URL")
+    hm_ingest_token: str | None = Field(default=None, alias="HM_INGEST_TOKEN")
+
     # Tailles de lot / limites (scalabilité).
     scheduler_batch_limit: int = Field(default=200, alias="SCHEDULER_BATCH_LIMIT")
     db_pool_max: int = Field(default=10, alias="DB_POOL_MAX")

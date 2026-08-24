@@ -11,6 +11,7 @@ ni l'event loop.
 from __future__ import annotations
 
 import asyncio
+import time
 
 from app.config import POLL_BOUNDS, POLLED_PLATFORMS, settings
 from app.connectors import available_platforms, get_connector
@@ -24,6 +25,12 @@ log = get_logger(__name__)
 # Concurrence max de polls HTTP simultanés (par tick).
 _POLL_CONCURRENCY = 20
 _FAIL_DISABLE_AFTER = 50
+
+# Horodatage (monotonic) du dernier tick scheduler qui s'est terminé sans lever
+# — utilisé par `build_health_checks()` pour détecter un scheduler figé.
+_last_tick_at: float | None = None
+# Un scheduler considéré figé au-delà de ce multiple du tick (cf. build_health_checks).
+_STALL_FACTOR = 3
 
 
 def _default_intervals() -> dict[str, int]:
@@ -40,6 +47,8 @@ async def run_scheduler() -> None:
     while True:
         try:
             await _scheduler_tick(sem)
+            global _last_tick_at
+            _last_tick_at = time.monotonic()
         except Exception:  # noqa: BLE001 — un tick raté ne doit pas tuer la boucle
             log.exception("scheduler tick failed")
         await asyncio.sleep(tick)
@@ -96,6 +105,59 @@ async def _poll_one(sem: asyncio.Semaphore, target) -> None:
             published_any = True
 
     await db.save_target_state(target, mark_polled=True, had_event=published_any)
+
+
+async def build_health_checks() -> dict:
+    """Construit `{status, checks, meta}` pour le Moddy Health Monitor.
+
+    Dépendances vitales (postgres, redis) mortes → `down`. Scheduler figé
+    (aucun tick réussi depuis `_STALL_FACTOR` × l'intervalle) → `degraded` :
+    le process est vivant mais ne fait plus son travail.
+    """
+    checks: dict[str, dict] = {}
+
+    start = time.perf_counter()
+    try:
+        async with asyncio.timeout(2):
+            async with db.get_pool().acquire() as conn:
+                await conn.fetchval("SELECT 1")
+        checks["postgres"] = {"ok": True, "latency_ms": round((time.perf_counter() - start) * 1000)}
+    except Exception as exc:  # noqa: BLE001
+        checks["postgres"] = {"ok": False, "error": str(exc)[:120]}
+
+    start = time.perf_counter()
+    try:
+        async with asyncio.timeout(2):
+            await r.get_redis().ping()
+        checks["redis"] = {"ok": True, "latency_ms": round((time.perf_counter() - start) * 1000)}
+    except Exception as exc:  # noqa: BLE001
+        checks["redis"] = {"ok": False, "error": str(exc)[:120]}
+
+    tick = settings.scheduler_tick_seconds
+    stall_age = None
+    if _last_tick_at is not None:
+        stall_age = time.monotonic() - _last_tick_at
+    scheduler_ok = stall_age is not None and stall_age <= tick * _STALL_FACTOR
+    checks["scheduler"] = {"ok": scheduler_ok, "last_tick_age_s": round(stall_age) if stall_age is not None else None}
+
+    return {
+        "status": _status_from_checks(checks),
+        "checks": checks,
+        "meta": {"last_tick_age_s": checks["scheduler"]["last_tick_age_s"]},
+    }
+
+
+def _status_from_checks(checks: dict[str, dict]) -> str:
+    """Décide le statut global à partir des checks (pure, testable sans infra).
+
+    `postgres`/`redis` sont vitaux (indisponibles → `down`). `scheduler` est
+    secondaire : le process répond mais ne fait plus son travail → `degraded`.
+    """
+    if not checks["postgres"]["ok"] or not checks["redis"]["ok"]:
+        return "down"
+    if not all(c["ok"] for c in checks.values()):
+        return "degraded"
+    return "ok"
 
 
 async def run_heartbeat() -> None:

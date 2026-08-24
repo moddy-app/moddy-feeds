@@ -30,6 +30,8 @@ Provisionner sur Railway :
 | `INSTAGRAM_ENABLED` | ⬜ | `false` par défaut |
 | `SCHEDULER_BATCH_LIMIT` | ⬜ | nb max de cibles par tick (déf. 200) |
 | `DB_POOL_MAX` | ⬜ | taille max du pool asyncpg (déf. 10) |
+| `HM_URL` | ⬜ | Moddy Health Monitor (sans slash final) — absent ⇒ heartbeat désactivé |
+| `HM_INGEST_TOKEN` | ⬜* | token d'ingestion (*requis avec `HM_URL`) |
 
 Il n'y a **aucun secret HTTP** (domaine, HMAC, token interne) : rien n'est exposé.
 
@@ -68,6 +70,14 @@ Pour filtrer dans Railway : utiliser le sélecteur de niveau (`error`, `warn`…
 
 - Le worker `heartbeat` écrit `feeds:heartbeat` toutes les 30 s (TTL ~90 s). Le
   backend surveille la présence de cette clé (`EXISTS feeds:heartbeat`).
+- Si `HM_URL`/`HM_INGEST_TOKEN` sont renseignés, un heartbeat sortant est aussi
+  poussé toutes les 20 s vers le **Moddy Health Monitor**
+  (`POST $HM_URL/ingest/heartbeat`, cf. `app/core/health_monitor.py`). Fire-and-
+  forget : un échec ne fait que logger un warning, jamais planter le service.
+  Statut calculé par `build_health_checks()` (`app/schedulers.py`) :
+  - `postgres`/`redis` injoignables → `down`.
+  - scheduler figé (aucun tick réussi depuis 3×`SCHEDULER_TICK_SECONDS`) → `degraded`.
+  - sinon → `ok`.
 - Railway redémarre automatiquement le process sur crash (`ON_FAILURE`).
 - Indicateurs utiles à grapher côté backend :
   - longueur de `notifications:queue` (`XLEN`) — alerte si le bot ne consomme pas.
