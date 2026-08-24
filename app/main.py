@@ -5,6 +5,7 @@ Tâches lancées en parallèle :
   • scheduler tick           (polling YouTube / RSS / Twitch / Instagram)
   • worker Bluesky Jetstream (websocket temps réel)
   • heartbeat                (healthcheck Railway via Redis)
+  • health monitor           (heartbeat sortant vers le Moddy Health Monitor)
 
 Arrêt propre sur SIGINT/SIGTERM : annulation des tâches puis fermeture des pools.
 """
@@ -14,14 +15,16 @@ from __future__ import annotations
 import asyncio
 import signal
 
+from app import __version__
 from app.commands import run_commands_consumer
 from app.config import settings
 from app.connectors import BlueskyConnector, get_connector
 from app.core.db import close_db, init_db
+from app.core.health_monitor import HeartbeatClient
 from app.core.http import close_http
 from app.core.redis import close_redis, get_redis
 from app.logging_config import get_logger, setup_logging
-from app.schedulers import run_heartbeat, run_scheduler
+from app.schedulers import build_health_checks, run_heartbeat, run_scheduler
 
 log = get_logger("moddy-feeds")
 
@@ -37,6 +40,17 @@ async def main() -> None:
     setup_logging()
     log.info("starting moddy-feeds…")
     await _bootstrap()
+
+    # Heartbeat vers le Moddy Health Monitor : fire-and-forget, se désactive
+    # proprement si HM_URL/HM_INGEST_TOKEN sont absents (cf. core/health_monitor.py).
+    health_monitor = HeartbeatClient(
+        "moddy-feeds",
+        url=settings.hm_url,
+        token=settings.hm_ingest_token,
+        version=__version__,
+        build=build_health_checks,
+    )
+    health_monitor.start()
 
     tasks: list[asyncio.Task] = [
         asyncio.create_task(run_commands_consumer(), name="commands"),
@@ -66,6 +80,7 @@ async def main() -> None:
     for t in tasks:
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
+    await health_monitor.stop()
     await _shutdown()
 
 
