@@ -80,6 +80,14 @@ class Settings(BaseSettings):
     hm_url: str | None = Field(default=None, alias="HM_URL")
     hm_ingest_token: str | None = Field(default=None, alias="HM_INGEST_TOKEN")
 
+    # Heartbeat Better Stack (cron/heartbeat monitor, cf. docs/integration.md).
+    # URL secrète complète (https://uptime.betterstack.com/api/v1/heartbeat/<TOKEN>).
+    # Absent → heartbeat désactivé proprement (pas d'impact sur le reste du service).
+    betterstack_heartbeat_url: str | None = Field(default=None, alias="BETTERSTACK_HEARTBEAT_URL")
+    betterstack_heartbeat_interval_seconds: int = Field(
+        default=180, alias="BETTERSTACK_HEARTBEAT_INTERVAL_SECONDS"
+    )
+
     # Tailles de lot / limites (scalabilité).
     scheduler_batch_limit: int = Field(default=200, alias="SCHEDULER_BATCH_LIMIT")
     db_pool_max: int = Field(default=10, alias="DB_POOL_MAX")

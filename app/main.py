@@ -6,6 +6,7 @@ Tâches lancées en parallèle :
   • worker Bluesky Jetstream (websocket temps réel)
   • heartbeat                (healthcheck Railway via Redis)
   • health monitor           (heartbeat sortant vers le Moddy Health Monitor)
+  • betterstack heartbeat    (heartbeat sortant vers Better Stack, toutes les 3 min)
 
 Arrêt propre sur SIGINT/SIGTERM : annulation des tâches puis fermeture des pools.
 """
@@ -20,11 +21,12 @@ from app.commands import run_commands_consumer
 from app.config import settings
 from app.connectors import BlueskyConnector, get_connector
 from app.core.db import close_db, init_db
+from app.core.betterstack_heartbeat import BetterStackHeartbeat
 from app.core.health_monitor import HeartbeatClient
 from app.core.http import close_http
 from app.core.redis import close_redis, get_redis
 from app.logging_config import get_logger, setup_logging
-from app.schedulers import build_health_checks, run_heartbeat, run_scheduler
+from app.schedulers import build_health_checks, build_health_status, run_heartbeat, run_scheduler
 
 log = get_logger("moddy-feeds")
 
@@ -51,6 +53,15 @@ async def main() -> None:
         build=build_health_checks,
     )
     health_monitor.start()
+
+    # Heartbeat sortant vers Better Stack : GET périodique tant que le service
+    # va bien, se désactive proprement si BETTERSTACK_HEARTBEAT_URL est absent.
+    betterstack_heartbeat = BetterStackHeartbeat(
+        url=settings.betterstack_heartbeat_url,
+        build_status=build_health_status,
+        interval=settings.betterstack_heartbeat_interval_seconds,
+    )
+    betterstack_heartbeat.start()
 
     tasks: list[asyncio.Task] = [
         asyncio.create_task(run_commands_consumer(), name="commands"),
@@ -81,6 +92,7 @@ async def main() -> None:
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
     await health_monitor.stop()
+    await betterstack_heartbeat.stop()
     await _shutdown()
 
 
