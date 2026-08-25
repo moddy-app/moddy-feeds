@@ -32,6 +32,8 @@ Provisionner sur Railway :
 | `DB_POOL_MAX` | ⬜ | taille max du pool asyncpg (déf. 10) |
 | `HM_URL` | ⬜ | Moddy Health Monitor (sans slash final) — absent ⇒ heartbeat désactivé |
 | `HM_INGEST_TOKEN` | ⬜* | token d'ingestion (*requis avec `HM_URL`) |
+| `BETTERSTACK_HEARTBEAT_URL` | ⬜ | URL secrète du heartbeat Better Stack — absente ⇒ heartbeat désactivé |
+| `BETTERSTACK_HEARTBEAT_INTERVAL_SECONDS` | ⬜ | période du ping (déf. 180 = 3 min, doit matcher la config Better Stack) |
 
 Il n'y a **aucun secret HTTP** (domaine, HMAC, token interne) : rien n'est exposé.
 
@@ -78,6 +80,16 @@ Pour filtrer dans Railway : utiliser le sélecteur de niveau (`error`, `warn`…
   - `postgres`/`redis` injoignables → `down`.
   - scheduler figé (aucun tick réussi depuis 3×`SCHEDULER_TICK_SECONDS`) → `degraded`.
   - sinon → `ok`.
+- Si `BETTERSTACK_HEARTBEAT_URL` est renseignée, un heartbeat Better Stack
+  (cron/heartbeat monitor) est aussi pingé toutes les
+  `BETTERSTACK_HEARTBEAT_INTERVAL_SECONDS` (déf. 180 s = 3 min, cf.
+  `app/core/betterstack_heartbeat.py`) :
+  - statut `ok` (même calcul que ci-dessus) → `GET $BETTERSTACK_HEARTBEAT_URL`.
+  - sinon (`degraded`/`down`) → `GET $BETTERSTACK_HEARTBEAT_URL/fail`, pour
+    déclencher l'incident sans attendre le délai de grâce.
+  - Fire-and-forget : un échec ne fait que logger un warning.
+  - La fréquence et la grace period doivent être configurées côté Better Stack
+    pour matcher `BETTERSTACK_HEARTBEAT_INTERVAL_SECONDS`.
 - Railway redémarre automatiquement le process sur crash (`ON_FAILURE`).
 - Indicateurs utiles à grapher côté backend :
   - longueur de `notifications:queue` (`XLEN`) — alerte si le bot ne consomme pas.

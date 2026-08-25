@@ -160,6 +160,12 @@ def _status_from_checks(checks: dict[str, dict]) -> str:
     return "ok"
 
 
+async def build_health_status() -> str:
+    """Statut seul (`ok`/`degraded`/`down`), pour le heartbeat Better Stack."""
+    checks = await build_health_checks()
+    return checks["status"]
+
+
 async def run_heartbeat() -> None:
     """Écrit `feeds:heartbeat` périodiquement (healthcheck surveillé par le backend)."""
     client = r.get_redis()
